@@ -163,6 +163,25 @@ export function InvestigatorConsole() {
     [cumulative],
   );
 
+  const exportReport = useCallback(() => {
+    const durationSec =
+      startedAtRef.current > 0
+        ? (performance.now() - startedAtRef.current) / 1000
+        : log.length > 0
+          ? log[log.length - 1]!.t
+          : 0;
+
+    generatePdfReport({
+      sessionId,
+      durationSec,
+      cumulative,
+      totalCumulative,
+      log,
+    });
+  }, [sessionId, cumulative, totalCumulative, log]);
+
+
+
   const startSession = useCallback(async () => {
     if (!modelReady) return;
     setError(null);
