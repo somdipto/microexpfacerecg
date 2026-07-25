@@ -270,15 +270,39 @@ export function InvestigatorConsole() {
               return next;
             });
 
-            // Emit a log entry every ~40 frames when high-confidence
+            // Emit a log entry every ~40 frames when high-confidence,
+            // capturing a snapshot of the current frame for the PDF report.
             if (
               smConf > 0.55 &&
               frameCounterRef.current % 40 === 0 &&
               frameCounterRef.current > 0
             ) {
               const t = (performance.now() - startedAtRef.current) / 1000;
+              let snapshot: string | undefined;
+              try {
+                const snap = document.createElement("canvas");
+                snap.width = 320;
+                snap.height = Math.round((v.videoHeight / v.videoWidth) * 320);
+                const sctx = snap.getContext("2d");
+                if (sctx) {
+                  sctx.drawImage(v, 0, 0, snap.width, snap.height);
+                  // Overlay bounding box (scaled)
+                  const scale = snap.width / v.videoWidth;
+                  sctx.strokeStyle = color;
+                  sctx.lineWidth = 2;
+                  sctx.strokeRect(
+                    box.x * scale,
+                    box.y * scale,
+                    box.width * scale,
+                    box.height * scale,
+                  );
+                  snapshot = snap.toDataURL("image/jpeg", 0.7);
+                }
+              } catch {
+                /* ignore snapshot failures */
+              }
               setLog((l) =>
-                [...l, { t, emotion: smLabel, conf: smConf }].slice(-40),
+                [...l, { t, emotion: smLabel, conf: smConf, snapshot }].slice(-40),
               );
             }
           } else {
