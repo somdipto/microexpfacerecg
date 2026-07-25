@@ -682,3 +682,304 @@ function makeSessionId() {
     `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
   );
 }
+
+// ---------------------------------------------------------------------------
+// PDF report generation
+// ---------------------------------------------------------------------------
+
+interface ReportInput {
+  sessionId: string;
+  durationSec: number;
+  cumulative: Record<Emotion, number>;
+  totalCumulative: number;
+  log: SessionLogEntry[];
+}
+
+function generatePdfReport(input: ReportInput) {
+  const { sessionId, durationSec, cumulative, totalCumulative, log } = input;
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = 40; // margin
+
+  // ---------- Cover / header ----------
+  doc.setFillColor(250, 247, 240);
+  doc.rect(0, 0, W, 90, "F");
+  doc.setTextColor(13, 117, 102);
+  doc.setFont("courier", "bold");
+  doc.setFontSize(9);
+  doc.text("MICRO-EXPRESSION RECOGNITION SYSTEM  ·  SESSION REPORT", M, 36);
+  doc.setTextColor(20, 20, 30);
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(20);
+  doc.text("Investigator Session Report", M, 66);
+  doc.setFont("courier", "normal");
+  doc.setFontSize(9);
+  doc.setTextColor(90, 90, 100);
+  doc.text(
+    `Session: ${sessionId}   ·   Duration: ${formatTime(durationSec)}   ·   Generated: ${new Date().toLocaleString()}`,
+    M,
+    82,
+  );
+
+  // ---------- Session summary block ----------
+  let y = 110;
+  doc.setDrawColor(220, 216, 200);
+  doc.setLineWidth(0.5);
+  doc.line(M, y, W - M, y);
+  y += 18;
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(12);
+  doc.setTextColor(20, 20, 30);
+  doc.text("Session Summary", M, y);
+  y += 6;
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  doc.setTextColor(90, 90, 100);
+  y += 12;
+  doc.text(
+    "Cumulative frequency of each Ekman-7 emotion detected across the session.",
+    M,
+    y,
+  );
+  y += 18;
+
+  // Cumulative bars
+  const barX = M;
+  const barW = W - 2 * M;
+  const barLabelW = 90;
+  const barValueW = 40;
+  const barTrackW = barW - barLabelW - barValueW - 20;
+  for (const e of EMOTIONS) {
+    const pct = totalCumulative === 0 ? 0 : cumulative[e] / totalCumulative;
+    doc.setFont("courier", "normal");
+    doc.setFontSize(10);
+    doc.setTextColor(60, 60, 70);
+    doc.text(e, barX, y + 10);
+    // track
+    doc.setFillColor(232, 228, 214);
+    doc.roundedRect(barX + barLabelW, y + 2, barTrackW, 10, 3, 3, "F");
+    // fill
+    const [r, g, b] = hexToRgb(EMOTION_COLOR[e]);
+    doc.setFillColor(r, g, b);
+    doc.roundedRect(
+      barX + barLabelW,
+      y + 2,
+      Math.max(2, barTrackW * pct),
+      10,
+      3,
+      3,
+      "F",
+    );
+    doc.setTextColor(40, 40, 50);
+    doc.text(`${Math.round(pct * 100)}%`, barX + barLabelW + barTrackW + 8, y + 10);
+    y += 18;
+  }
+
+  // ---------- Timeline chart ----------
+  y += 12;
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(12);
+  doc.setTextColor(20, 20, 30);
+  doc.text("Emotion Timeline", M, y);
+  y += 6;
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(9);
+  doc.setTextColor(90, 90, 100);
+  y += 12;
+  doc.text(
+    "Each dot is a high-confidence detection (>0.55). Y-axis groups by emotion; x-axis is session time.",
+    M,
+    y,
+  );
+  y += 10;
+
+  const chartX = M;
+  const chartY = y + 8;
+  const chartW = W - 2 * M;
+  const chartH = 190;
+  // frame
+  doc.setDrawColor(220, 216, 200);
+  doc.setFillColor(252, 250, 244);
+  doc.rect(chartX, chartY, chartW, chartH, "FD");
+
+  const rowH = chartH / EMOTIONS.length;
+  // Y grid + labels
+  doc.setFont("courier", "normal");
+  doc.setFontSize(8);
+  EMOTIONS.forEach((e, i) => {
+    const ry = chartY + i * rowH;
+    if (i > 0) {
+      doc.setDrawColor(230, 226, 210);
+      doc.line(chartX, ry, chartX + chartW, ry);
+    }
+    doc.setTextColor(100, 100, 110);
+    doc.text(e, chartX + 4, ry + rowH / 2 + 3);
+  });
+
+  const maxT = Math.max(durationSec, 1, ...log.map((l) => l.t));
+  // X-axis ticks
+  const ticks = 5;
+  doc.setDrawColor(220, 216, 200);
+  for (let i = 0; i <= ticks; i++) {
+    const tx = chartX + (chartW * i) / ticks;
+    doc.line(tx, chartY + chartH, tx, chartY + chartH + 4);
+    const tLabel = formatTime((maxT * i) / ticks);
+    doc.setTextColor(120, 120, 130);
+    doc.text(tLabel, tx - 12, chartY + chartH + 14);
+  }
+
+  // Plot dots + trend line per emotion row
+  for (const entry of log) {
+    const rowIdx = EMOTIONS.indexOf(entry.emotion);
+    if (rowIdx < 0) continue;
+    const cx = chartX + (entry.t / maxT) * chartW;
+    const cy = chartY + rowIdx * rowH + rowH / 2;
+    const [r, g, b] = hexToRgb(EMOTION_COLOR[entry.emotion]);
+    doc.setFillColor(r, g, b);
+    const radius = 2 + entry.conf * 4;
+    doc.circle(cx, cy, radius, "F");
+  }
+
+  y = chartY + chartH + 28;
+
+  // ---------- Event log table ----------
+  if (y > H - 100) {
+    doc.addPage();
+    y = M;
+  }
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(12);
+  doc.setTextColor(20, 20, 30);
+  doc.text("Event Log", M, y);
+  y += 16;
+
+  // Table header
+  const cols = [
+    { label: "Time", x: M, w: 60 },
+    { label: "Emotion", x: M + 60, w: 90 },
+    { label: "Confidence", x: M + 150, w: 90 },
+    { label: "Note", x: M + 240, w: W - 2 * M - 240 },
+  ];
+  doc.setFillColor(238, 233, 218);
+  doc.rect(M, y - 12, W - 2 * M, 18, "F");
+  doc.setFont("courier", "bold");
+  doc.setFontSize(9);
+  doc.setTextColor(60, 60, 70);
+  cols.forEach((c) => doc.text(c.label, c.x + 4, y));
+  y += 10;
+
+  doc.setFont("courier", "normal");
+  doc.setFontSize(9);
+  const rows = log.slice().reverse();
+  for (const l of rows) {
+    if (y > H - 40) {
+      doc.addPage();
+      y = M;
+    }
+    doc.setTextColor(60, 60, 70);
+    doc.text(formatTime(l.t), cols[0]!.x + 4, y);
+    const [r, g, b] = hexToRgb(EMOTION_COLOR[l.emotion]);
+    doc.setTextColor(r, g, b);
+    doc.text(l.emotion, cols[1]!.x + 4, y);
+    doc.setTextColor(60, 60, 70);
+    doc.text(l.conf.toFixed(2), cols[2]!.x + 4, y);
+    doc.text(noteFor(l.emotion, l.conf), cols[3]!.x + 4, y);
+    y += 14;
+  }
+
+  // ---------- Snapshots page ----------
+  const withSnap = log.filter((l) => l.snapshot);
+  if (withSnap.length > 0) {
+    doc.addPage();
+    let sy = M;
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(14);
+    doc.setTextColor(20, 20, 30);
+    doc.text("Flagged Frame Snapshots", M, sy);
+    sy += 8;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(90, 90, 100);
+    sy += 14;
+    doc.text(
+      "Frames captured at high-confidence detections, with the CNN bounding box overlay.",
+      M,
+      sy,
+    );
+    sy += 18;
+
+    const cellW = (W - 2 * M - 20) / 2;
+    const cellH = cellW * 0.62;
+    let col = 0;
+    for (const l of withSnap.slice(0, 8)) {
+      if (sy + cellH + 40 > H - M) {
+        doc.addPage();
+        sy = M;
+      }
+      const cx = M + col * (cellW + 20);
+      try {
+        doc.addImage(l.snapshot!, "JPEG", cx, sy, cellW, cellH);
+      } catch {
+        /* skip broken snapshot */
+      }
+      doc.setDrawColor(220, 216, 200);
+      doc.rect(cx, sy, cellW, cellH);
+      doc.setFont("courier", "normal");
+      doc.setFontSize(9);
+      const [r, g, b] = hexToRgb(EMOTION_COLOR[l.emotion]);
+      doc.setTextColor(r, g, b);
+      doc.text(
+        `${formatTime(l.t)}  ·  ${l.emotion.toUpperCase()}  ·  ${(l.conf * 100).toFixed(0)}%`,
+        cx,
+        sy + cellH + 14,
+      );
+      col += 1;
+      if (col >= 2) {
+        col = 0;
+        sy += cellH + 30;
+      }
+    }
+  }
+
+  // ---------- Footer on every page ----------
+  const pageCount = doc.getNumberOfPages();
+  for (let p = 1; p <= pageCount; p++) {
+    doc.setPage(p);
+    doc.setFont("courier", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(140, 140, 150);
+    doc.text(
+      `AIT · CSE · 2025-26   ·   CNN-LSTM Pipeline   ·   ${sessionId}`,
+      M,
+      H - 18,
+    );
+    doc.text(`Page ${p} / ${pageCount}`, W - M - 50, H - 18);
+  }
+
+  doc.save(`session_${sessionId}.pdf`);
+}
+
+function hexToRgb(hex: string): [number, number, number] {
+  const h = hex.replace("#", "");
+  return [
+    parseInt(h.substring(0, 2), 16),
+    parseInt(h.substring(2, 4), 16),
+    parseInt(h.substring(4, 6), 16),
+  ];
+}
+
+function noteFor(e: Emotion, conf: number): string {
+  const strong = conf > 0.75;
+  const map: Record<Emotion, string> = {
+    Fear: strong ? "High-stakes concealment cue" : "Fear onset",
+    Anger: strong ? "Suppressed anger apex" : "Anger cue",
+    Disgust: strong ? "Repression pattern" : "Disgust micro-cue",
+    Happiness: strong ? "Duchenne happiness" : "Positive affect",
+    Sadness: strong ? "Grief marker" : "Sadness onset",
+    Surprise: strong ? "Brief apex after direct question" : "Surprise cue",
+    Contempt: strong ? "Asymmetric lip corner" : "Contempt trace",
+  };
+  return map[e];
+}
