@@ -419,7 +419,12 @@ export function InvestigatorConsole() {
                 onClick={stopSession}
                 disabled={state !== "PROCESSING"}
               />
-              <PanelButton icon={<FileText className="h-4 w-4" />} label="View Reports" disabled />
+              <PanelButton
+                icon={<FileText className="h-4 w-4" />}
+                label="Export PDF Report"
+                onClick={exportReport}
+                disabled={log.length === 0 && totalCumulative === 0}
+              />
               <PanelButton icon={<SettingsIcon className="h-4 w-4" />} label="Settings" disabled />
 
               <div className="my-4 border-t border-dashed border-border" />
