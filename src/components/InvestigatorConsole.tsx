@@ -89,6 +89,7 @@ interface SessionLogEntry {
   t: number; // seconds from start
   emotion: Emotion;
   conf: number;
+  snapshot?: string; // dataURL frame capture at flag time
 }
 
 export function InvestigatorConsole() {
