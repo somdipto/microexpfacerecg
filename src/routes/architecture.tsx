@@ -7,8 +7,16 @@ import {
   Layers,
   Activity,
   BarChart3,
+  Download,
 } from "lucide-react";
-
+import {
+  STAGES,
+  FLOW,
+  RUNTIME,
+  RATIONALE,
+  DEMO_STEPS,
+} from "@/lib/architecture-data";
+import { generateArchitecturePdf } from "@/lib/architecture-report";
 
 export const Route = createFileRoute("/architecture")({
   component: ArchitecturePage,
@@ -35,103 +43,14 @@ export const Route = createFileRoute("/architecture")({
   }),
 });
 
-type Stage = {
-  id: string;
-  title: string;
-  icon: React.ReactNode;
-  what: string;
-  how: string[];
-  io: [string, string];
-  tech: string;
+const ICONS: Record<string, React.ReactNode> = {
+  M1: <Camera className="h-4 w-4" />,
+  M2: <Crop className="h-4 w-4" />,
+  M3: <Cpu className="h-4 w-4" />,
+  M4: <Layers className="h-4 w-4" />,
+  M5: <Activity className="h-4 w-4" />,
+  M6: <BarChart3 className="h-4 w-4" />,
 };
-
-const STAGES: Stage[] = [
-  {
-    id: "M1",
-    title: "Input Acquisition",
-    icon: <Camera className="h-4 w-4" />,
-    what:
-      "Grabs a continuous stream of still images (frames) from the webcam or a loaded video file. Nothing leaves the machine.",
-    how: [
-      "getUserMedia() opens the camera and pipes it into a <video> element.",
-      "A requestAnimationFrame loop samples the video ~10–30 times per second.",
-      "Each sampled frame is drawn onto an offscreen canvas so pixels can be read.",
-    ],
-    io: ["Camera / video file", "RGB frame (e.g. 640×480)"],
-    tech: "MediaDevices API · Canvas 2D",
-  },
-  {
-    id: "M2",
-    title: "Face Detection & Pre-processing",
-    icon: <Crop className="h-4 w-4" />,
-    what:
-      "Finds where the face is in the frame, crops it, and normalises lighting so the classifier sees a consistent input.",
-    how: [
-      "A lightweight detector (SSD/MTCNN-style cascade) returns a bounding box + 68 landmarks.",
-      "The face is cropped, aligned on the eye axis and resized to a fixed square.",
-      "CLAHE (contrast-limited adaptive histogram equalisation) evens out shadows and back-light.",
-      "If no box is returned for N frames, the UI raises the 'No face detected' warning instead of guessing.",
-    ],
-    io: ["RGB frame", "Aligned face crop (grayscale-normalised)"],
-    tech: "MTCNN / SSD-MobileNet · Landmarks · CLAHE",
-  },
-  {
-    id: "M3",
-    title: "CNN Spatial Feature Extraction",
-    icon: <Cpu className="h-4 w-4" />,
-    what:
-      "Turns the face image into numbers. A convolutional network compresses the crop into a 512-dimensional feature vector describing muscle configuration — brow raise, lip corner pull, nose wrinkle.",
-    how: [
-      "Convolution layers learn edges → textures → facial action units, layer by layer.",
-      "The final pooling layer outputs one 512-D embedding per frame (the classification head is removed).",
-      "This is transfer learning: the backbone is pre-trained, then fine-tuned on micro-expression data.",
-    ],
-    io: ["Aligned face crop", "512-D feature vector"],
-    tech: "ResNet-50 backbone · Global average pooling",
-  },
-  {
-    id: "M4",
-    title: "Temporal Sequence Buffer",
-    icon: <Layers className="h-4 w-4" />,
-    what:
-      "A micro-expression is a movement, not a photo — it lasts 40–500 ms. So the system stacks the last 16 frame-vectors into a sliding window.",
-    how: [
-      "Ring buffer of length 16: newest vector pushed in, oldest dropped out.",
-      "Result is a 16 × 512 matrix — the shape of the expression over time.",
-      "The console's 'Sequence Buffer' meter shows this filling up before predictions stabilise.",
-    ],
-    io: ["512-D vector per frame", "16 × 512 sequence tensor"],
-    tech: "Sliding window · Stride 1",
-  },
-  {
-    id: "M5",
-    title: "LSTM Temporal Modelling",
-    icon: <Activity className="h-4 w-4" />,
-    what:
-      "Two stacked LSTM layers read the 16-step sequence in order and learn the onset → apex → offset dynamics that separate a genuine micro-expression from a slow, deliberate pose.",
-    how: [
-      "LSTM cells carry a hidden state, so frame 12 is interpreted in light of frames 1–11.",
-      "Layer 1 (256 units) captures short motion; layer 2 (256 units) captures the full arc.",
-      "Dropout between layers prevents memorising individual subjects.",
-    ],
-    io: ["16 × 512 sequence", "256-D temporal summary"],
-    tech: "2 × LSTM(256) · Dropout 0.5",
-  },
-  {
-    id: "M6",
-    title: "Classification & Session Analytics",
-    icon: <BarChart3 className="h-4 w-4" />,
-    what:
-      "A dense layer + softmax converts the temporal summary into 7 probabilities that add up to 1. The highest one is drawn on screen; everything is logged for the report.",
-    how: [
-      "Softmax over the 7 Ekman classes: fear, anger, disgust, happiness, sadness, surprise, contempt.",
-      "Predictions below the confidence threshold are suppressed rather than shown as fact.",
-      "Accepted predictions increment the cumulative frequency bars and append to the event log with a timestamp + snapshot.",
-    ],
-    io: ["256-D temporal summary", "Label + confidence + session record"],
-    tech: "Dense → Softmax(7) · Argmax + threshold",
-  },
-];
 
 function ArchitecturePage() {
   return (
@@ -151,13 +70,22 @@ function ArchitecturePage() {
               the investigator's screen.
             </p>
           </div>
-          <Link
-            to="/"
-            className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 font-mono-tight text-[11px] uppercase tracking-[0.16em] text-foreground transition-colors hover:bg-accent"
-          >
-            <ArrowLeft className="h-3.5 w-3.5" />
-            Back to console
-          </Link>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={() => generateArchitecturePdf()}
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-2 font-mono-tight text-[11px] uppercase tracking-[0.16em] text-primary-foreground transition-colors hover:bg-primary/90"
+            >
+              <Download className="h-3.5 w-3.5" />
+              Export architecture report
+            </button>
+            <Link
+              to="/"
+              className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 font-mono-tight text-[11px] uppercase tracking-[0.16em] text-foreground transition-colors hover:bg-accent"
+            >
+              <ArrowLeft className="h-3.5 w-3.5" />
+              Back to console
+            </Link>
+          </div>
         </header>
         <div className="mb-6 h-px bg-border" />
 
@@ -167,21 +95,12 @@ function ArchitecturePage() {
             End-to-end data flow
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2 font-mono-tight text-[11px]">
-            {[
-              "Webcam",
-              "Face detect",
-              "CLAHE crop",
-              "CNN 512-D",
-              "Buffer 16",
-              "LSTM 256×2",
-              "Softmax 7",
-              "Overlay + Report",
-            ].map((n, i, arr) => (
+            {FLOW.map((n, i) => (
               <span key={n} className="flex items-center gap-2">
                 <span className="rounded-md border border-border bg-panel px-2.5 py-1.5 text-foreground">
                   {n}
                 </span>
-                {i < arr.length - 1 && <span className="text-primary">→</span>}
+                {i < FLOW.length - 1 && <span className="text-primary">→</span>}
               </span>
             ))}
           </div>
@@ -201,7 +120,7 @@ function ArchitecturePage() {
             >
               <div className="flex flex-wrap items-center gap-3">
                 <span className="flex h-8 w-8 items-center justify-center rounded-md bg-primary text-primary-foreground">
-                  {s.icon}
+                  {ICONS[s.id]}
                 </span>
                 <div>
                   <div className="font-mono-tight text-[10px] uppercase tracking-[0.2em] text-primary">
@@ -248,25 +167,29 @@ function ArchitecturePage() {
           ))}
         </ol>
 
+        {/* Runtime characteristics */}
+        <section className="mt-8 rounded-xl border border-border bg-card p-4 md:p-6">
+          <div className="font-mono-tight text-[10px] uppercase tracking-[0.2em] text-primary">
+            Runtime characteristics
+          </div>
+          <dl className="mt-3 divide-y divide-border">
+            {RUNTIME.map(([k, v]) => (
+              <div key={k} className="grid gap-1 py-2.5 md:grid-cols-[220px_1fr]">
+                <dt className="font-mono-tight text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
+                  {k}
+                </dt>
+                <dd className="text-sm">{v}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+
         {/* Why this design */}
         <section className="mt-8 grid gap-4 md:grid-cols-3">
-          {[
-            {
-              t: "Why a CNN?",
-              d: "Images are spatial. Convolutions share weights across the image, so the model learns 'brow raised' once instead of separately for every pixel position.",
-            },
-            {
-              t: "Why an LSTM?",
-              d: "Micro-expressions are defined by how fast they appear and vanish. A single frame cannot express duration; a recurrent layer can.",
-            },
-            {
-              t: "Why on-device?",
-              d: "Faces are biometric data. Running inference locally means frames are never transmitted, which keeps interview footage private by construction.",
-            },
-          ].map((c) => (
-            <div key={c.t} className="rounded-xl border border-border bg-card p-4">
-              <h3 className="font-serif text-lg font-semibold">{c.t}</h3>
-              <p className="mt-2 text-sm text-muted-foreground">{c.d}</p>
+          {RATIONALE.map(([t, d]) => (
+            <div key={t} className="rounded-xl border border-border bg-card p-4">
+              <h3 className="font-serif text-lg font-semibold">{t}</h3>
+              <p className="mt-2 text-sm text-muted-foreground">{d}</p>
             </div>
           ))}
         </section>
@@ -280,14 +203,7 @@ function ArchitecturePage() {
             Steps to reproduce the result
           </h2>
           <ol className="mt-4 space-y-2">
-            {[
-              "Open the console and press Start Live Analysis; grant camera access (M1 begins).",
-              "Watch the bounding box lock onto the face — that is M2 reporting a detection.",
-              "Observe the Sequence Buffer meter fill to 16/16; until then M5 has no full window.",
-              "Hold a neutral face, then flash a brief expression. The label and confidence update within ~500 ms.",
-              "Cover the camera: M2 fails, the 'No face detected' warning appears, and no prediction is faked.",
-              "Let the session run 30–60 s, press Stop, then Export PDF Report for timeline, log and snapshots.",
-            ].map((s, i) => (
+            {DEMO_STEPS.map((s, i) => (
               <li key={s} className="flex gap-3 text-sm">
                 <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-primary font-mono-tight text-[10px] text-primary-foreground">
                   {i + 1}
