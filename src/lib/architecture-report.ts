@@ -106,9 +106,15 @@ export function generateArchitecturePdf() {
   doc.setFontSize(7.5);
   FLOW.forEach((node, i) => {
     const w = doc.getTextWidth(node) + 16;
-    if (fx + w > W - M) {
+    const arrowW = i > 0 ? 14 : 0;
+    if (fx + arrowW + w > W - M) {
       fx = M;
       fy += 26;
+    } else if (arrowW) {
+      doc.setFont("courier", "normal");
+      doc.setTextColor(...TEAL);
+      doc.text(">", fx + 4, fy + 12);
+      fx += arrowW;
     }
     doc.setFillColor(...PANEL);
     doc.setDrawColor(215, 210, 198);
@@ -117,13 +123,9 @@ export function generateArchitecturePdf() {
     doc.setFont("courier", "normal");
     doc.text(node, fx + 8, fy + 12);
     fx += w;
-    if (i < FLOW.length - 1) {
-      doc.setTextColor(...TEAL);
-      doc.text(">", fx + 3, fy + 12);
-      fx += 14;
-    }
   });
-  y = fy + 36;
+  y = fy + 50;
+
 
   // runtime table
   h2("Runtime characteristics");
