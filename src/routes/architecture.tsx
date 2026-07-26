@@ -7,8 +7,8 @@ import {
   Layers,
   Activity,
   BarChart3,
-  FileText,
 } from "lucide-react";
+
 
 export const Route = createFileRoute("/architecture")({
   component: ArchitecturePage,
