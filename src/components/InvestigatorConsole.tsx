@@ -15,6 +15,8 @@ import {
   Cpu,
   Layers,
   Activity,
+  Network,
+
 } from "lucide-react";
 
 /**
