@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "@tanstack/react-router";
 import * as faceapi from "face-api.js";
 import { jsPDF } from "jspdf";
+
 import {
   Play,
   Square,
@@ -13,6 +15,8 @@ import {
   Cpu,
   Layers,
   Activity,
+  Network,
+
 } from "lucide-react";
 
 /**
@@ -368,9 +372,19 @@ export function InvestigatorConsole() {
               Three-panel layout for the investigator
             </h1>
           </div>
-          <div className="font-mono-tight text-xs text-muted-foreground">
-            AIT · CSE · 2025-26
+          <div className="flex items-center gap-3">
+            <Link
+              to="/architecture"
+              className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 font-mono-tight text-[11px] uppercase tracking-[0.16em] text-foreground transition-colors hover:bg-accent"
+            >
+              <Network className="h-3.5 w-3.5 text-primary" />
+              View architecture
+            </Link>
+            <span className="font-mono-tight text-xs text-muted-foreground">
+              AIT · CSE · 2025-26
+            </span>
           </div>
+
         </header>
         <div className="mb-6 h-px bg-border" />
 
