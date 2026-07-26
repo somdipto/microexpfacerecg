@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link } from "@tanstack/react-router";
 import * as faceapi from "face-api.js";
 import { jsPDF } from "jspdf";
+
 import {
   Play,
   Square,
