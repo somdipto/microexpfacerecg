@@ -1,0 +1,1000 @@
+     1→     1→import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+     2→     2→import { Link } from "@tanstack/react-router";
+     3→     3→import * as faceapi from "face-api.js";
+     4→     4→import { jsPDF } from "jspdf";
+     5→     5→
+     6→     6→import {
+     7→     7→  Play,
+     8→     8→  Square,
+     9→     9→  Video,
+    10→    10→  FileText,
+    11→    11→  Settings as SettingsIcon,
+    12→    12→  AlertTriangle,
+    13→    13→  Circle,
+    14→    14→  Camera,
+    15→    15→  Cpu,
+    16→    16→  Layers,
+    17→    17→  Activity,
+    18→    18→  Network,
+    19→    19→
+    20→    20→} from "lucide-react";
+    21→    21→
+    22→    22→/**
+    23→    23→ * Investigator Console
+    24→    24→ *
+    25→    25→ * Implements the M1–M6 pipeline described in the design deck as a live browser
+    26→    26→ * demo. Uses face-api.js for on-device face detection + a lightweight CNN
+    27→    27→ * emotion classifier so we can drive a truly real-time preview from the webcam
+    28→    28→ * while presenting the pipeline (VideoSource → FacePreprocessor → CNN feature
+    29→    29→ * extractor → SequenceBuffer → LSTM analyser → Softmax classifier) faithfully.
+    30→    30→ *
+    31→    31→ * The 7 face-api emotions are re-mapped to the Ekman-7 set used in the deck.
+    32→    32→ */
+    33→    33→
+    34→    34→// Ekman-7 order shown in the wireframe's Session Summary panel
+    35→    35→const EMOTIONS = [
+    36→    36→  "Fear",
+    37→    37→  "Anger",
+    38→    38→  "Disgust",
+    39→    39→  "Happiness",
+    40→    40→  "Sadness",
+    41→    41→  "Surprise",
+    42→    42→  "Contempt",
+    43→    43→] as const;
+    44→    44→type Emotion = (typeof EMOTIONS)[number];
+    45→    45→
+    46→    46→// face-api expression -> Ekman-7. face-api doesn't ship "contempt"; we
+    47→    47→// approximate it from asymmetric neutral/disgust as a lightweight heuristic
+    48→    48→// so the summary panel matches the deck exactly.
+    49→    49→function mapFaceApiToEkman(
+    50→    50→  e: faceapi.FaceExpressions,
+    51→    51→): { label: Emotion; conf: number; dist: Record<Emotion, number> } {
+    52→    52→  const contempt = Math.min(0.35, e.disgusted * 0.35 + e.neutral * 0.08);
+    53→    53→  const raw: Record<Emotion, number> = {
+    54→    54→    Fear: e.fearful,
+    55→    55→    Anger: e.angry,
+    56→    56→    Disgust: Math.max(0, e.disgusted - contempt),
+    57→    57→    Happiness: e.happy,
+    58→    58→    Sadness: e.sad,
+    59→    59→    Surprise: e.surprised,
+    60→    60→    Contempt: contempt,
+    61→    61→  };
+    62→    62→  const sum = Object.values(raw).reduce((a, b) => a + b, 0) || 1;
+    63→    63→  const dist = Object.fromEntries(
+    64→    64→    (Object.keys(raw) as Emotion[]).map((k) => [k, raw[k] / sum]),
+    65→    65→  ) as Record<Emotion, number>;
+    66→    66→
+    67→    67→  let label: Emotion = "Fear";
+    68→    68→  let conf = 0;
+    69→    69→  for (const k of EMOTIONS) {
+    70→    70→    if (dist[k] > conf) {
+    71→    71→      conf = dist[k];
+    72→    72→      label = k;
+    73→    73→    }
+    74→    74→  }
+    75→    75→  return { label, conf, dist };
+    76→    76→}
+    77→    77→
+    78→    78→const EMOTION_COLOR: Record<Emotion, string> = {
+    79→    79→  Fear: "#0d7566",
+    80→    80→  Anger: "#b3452b",
+    81→    81→  Disgust: "#7a5b1f",
+    82→    82→  Happiness: "#5a7a2a",
+    83→    83→  Sadness: "#3a5f7a",
+    84→    84→  Surprise: "#8a4d80",
+    85→    85→  Contempt: "#6b6b6b",
+    86→    86→};
+    87→    87→
+    88→    88→const MODEL_URL =
+    89→    89→  "https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights";
+    90→    90→
+    91→    91→type PipelineState = "IDLE" | "LOADING" | "PROCESSING" | "PAUSED" | "ERROR";
+    92→    92→
+    93→    93→interface SessionLogEntry {
+    94→    94→  t: number; // seconds from start
+    95→    95→  emotion: Emotion;
+    96→    96→  conf: number;
+    97→    97→  snapshot?: string; // dataURL frame capture at flag time
+    98→    98→}
+    99→    99→
+   100→   100→export function InvestigatorConsole() {
+   101→   101→  const videoRef = useRef<HTMLVideoElement>(null);
+   102→   102→  const canvasRef = useRef<HTMLCanvasElement>(null);
+   103→   103→  const rafRef = useRef<number | null>(null);
+   104→   104→  const streamRef = useRef<MediaStream | null>(null);
+   105→   105→  const framesSinceFaceRef = useRef(0);
+   106→   106→  const frameCounterRef = useRef(0);
+   107→   107→  const lastFpsTickRef = useRef(performance.now());
+   108→   108→  const startedAtRef = useRef<number>(0);
+   109→   109→  // SequenceBuffer (M4): 16-frame sliding window of 512-D features (we store
+   110→   110→  // the 7-way distribution as a lightweight stand-in for the CNN feature
+   111→   111→  // vector for the on-screen buffer indicator).
+   112→   112→  const seqBufferRef = useRef<Record<Emotion, number>[]>([]);
+   113→   113→
+   114→   114→  const [state, setState] = useState<PipelineState>("IDLE");
+   115→   115→  const [modelReady, setModelReady] = useState(false);
+   116→   116→  const [error, setError] = useState<string | null>(null);
+   117→   117→  const [noFaceWarning, setNoFaceWarning] = useState(false);
+   118→   118→  const [fps, setFps] = useState(0);
+   119→   119→  const [currentLabel, setCurrentLabel] = useState<Emotion | null>(null);
+   120→   120→  const [currentConf, setCurrentConf] = useState(0);
+   121→   121→  const [bufferFill, setBufferFill] = useState(0);
+   122→   122→  const [cumulative, setCumulative] = useState<Record<Emotion, number>>(() =>
+   123→   123→    Object.fromEntries(EMOTIONS.map((e) => [e, 0])) as Record<Emotion, number>,
+   124→   124→  );
+   125→   125→  const [log, setLog] = useState<SessionLogEntry[]>([]);
+   126→   126→  const [sessionId] = useState(() => makeSessionId());
+   127→   127→
+   128→   128→  // Load face-api models once
+   129→   129→  useEffect(() => {
+   130→   130→    let cancelled = false;
+   131→   131→    (async () => {
+   132→   132→      try {
+   133→   133→        setState("LOADING");
+   134→   134→        await Promise.all([
+   135→   135→          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+   136→   136→          faceapi.nets.faceExpressionNet.loadFromUri(MODEL_URL),
+   137→   137→        ]);
+   138→   138→        if (cancelled) return;
+   139→   139→        setModelReady(true);
+   140→   140→        setState("IDLE");
+   141→   141→      } catch (e) {
+   142→   142→        if (cancelled) return;
+   143→   143→        setError((e as Error).message || "Failed to load models");
+   144→   144→        setState("ERROR");
+   145→   145→      }
+   146→   146→    })();
+   147→   147→    return () => {
+   148→   148→      cancelled = true;
+   149→   149→    };
+   150→   150→  }, []);
+   151→   151→
+   152→   152→  const stopSession = useCallback(() => {
+   153→   153→    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+   154→   154→    rafRef.current = null;
+   155→   155→    if (streamRef.current) {
+   156→   156→      streamRef.current.getTracks().forEach((t) => t.stop());
+   157→   157→      streamRef.current = null;
+   158→   158→    }
+   159→   159→    if (videoRef.current) videoRef.current.srcObject = null;
+   160→   160→    setState((prev) => (prev === "ERROR" ? prev : "IDLE"));
+   161→   161→  }, []);
+   162→   162→
+   163→   163→  useEffect(() => () => stopSession(), [stopSession]);
+   164→   164→
+   165→   165→  const totalCumulative = useMemo(
+   166→   166→    () => Object.values(cumulative).reduce((a, b) => a + b, 0),
+   167→   167→    [cumulative],
+   168→   168→  );
+   169→   169→
+   170→   170→  const exportReport = useCallback(() => {
+   171→   171→    const durationSec =
+   172→   172→      startedAtRef.current > 0
+   173→   173→        ? (performance.now() - startedAtRef.current) / 1000
+   174→   174→        : log.length > 0
+   175→   175→          ? log[log.length - 1]!.t
+   176→   176→          : 0;
+   177→   177→
+   178→   178→    generatePdfReport({
+   179→   179→      sessionId,
+   180→   180→      durationSec,
+   181→   181→      cumulative,
+   182→   182→      totalCumulative,
+   183→   183→      log,
+   184→   184→    });
+   185→   185→  }, [sessionId, cumulative, totalCumulative, log]);
+   186→   186→
+   187→   187→
+   188→   188→
+   189→   189→  const startSession = useCallback(async () => {
+   190→   190→    if (!modelReady) return;
+   191→   191→    setError(null);
+   192→   192→    try {
+   193→   193→      const stream = await navigator.mediaDevices.getUserMedia({
+   194→   194→        video: { width: 1280, height: 720, facingMode: "user" },
+   195→   195→        audio: false,
+   196→   196→      });
+   197→   197→      streamRef.current = stream;
+   198→   198→      if (!videoRef.current) return;
+   199→   199→      videoRef.current.srcObject = stream;
+   200→   200→      await videoRef.current.play();
+   201→   201→      startedAtRef.current = performance.now();
+   202→   202→      frameCounterRef.current = 0;
+   203→   203→      framesSinceFaceRef.current = 0;
+   204→   204→      seqBufferRef.current = [];
+   205→   205→      setLog([]);
+   206→   206→      setCumulative(
+   207→   207→        Object.fromEntries(EMOTIONS.map((e) => [e, 0])) as Record<Emotion, number>,
+   208→   208→      );
+   209→   209→      setState("PROCESSING");
+   210→   210→      loop();
+   211→   211→    } catch (e) {
+   212→   212→      setError(
+   213→   213→        (e as Error).message ||
+   214→   214→          "Camera access denied. Grant webcam permission and retry.",
+   215→   215→      );
+   216→   216→      setState("ERROR");
+   217→   217→    }
+   218→   218→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   219→   219→  }, [modelReady]);
+   220→   220→
+   221→   221→  // Main frame loop (M1 → M6)
+   222→   222→  const loop = useCallback(async () => {
+   223→   223→    const video = videoRef.current;
+   224→   224→    const canvas = canvasRef.current;
+   225→   225→    if (!video || !canvas) return;
+   226→   226→
+   227→   227→    const tick = async () => {
+   228→   228→      if (!videoRef.current || !canvasRef.current) return;
+   229→   229→      const v = videoRef.current;
+   230→   230→      const c = canvasRef.current;
+   231→   231→
+   232→   232→      if (v.readyState >= 2 && v.videoWidth > 0) {
+   233→   233→        c.width = v.videoWidth;
+   234→   234→        c.height = v.videoHeight;
+   235→   235→
+   236→   236→        // M2: face detection + preprocessing (face-api handles crop/resize)
+   237→   237→        const detection = await faceapi
+   238→   238→          .detectSingleFace(v, new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 }))
+   239→   239→          .withFaceExpressions();
+   240→   240→
+   241→   241→        const ctx = c.getContext("2d");
+   242→   242→        if (ctx) {
+   243→   243→          ctx.clearRect(0, 0, c.width, c.height);
+   244→   244→          if (detection) {
+   245→   245→            framesSinceFaceRef.current = 0;
+   246→   246→            setNoFaceWarning(false);
+   247→   247→            const { label, conf, dist } = mapFaceApiToEkman(detection.expressions);
+   248→   248→
+   249→   249→            // M4: push to sliding window (16 frames, stride 4)
+   250→   250→            seqBufferRef.current.push(dist);
+   251→   251→            if (seqBufferRef.current.length > 16) seqBufferRef.current.shift();
+   252→   252→            setBufferFill(seqBufferRef.current.length);
+   253→   253→
+   254→   254→            // M5+M6: smooth the last 16-frame window (stand-in for LSTM
+   255→   255→            // temporal integration) and re-argmax for the displayed label.
+   256→   256→            const win = seqBufferRef.current;
+   257→   257→            const avg = Object.fromEntries(
+   258→   258→              EMOTIONS.map((e) => [
+   259→   259→                e,
+   260→   260→                win.reduce((a, b) => a + b[e], 0) / win.length,
+   261→   261→              ]),
+   262→   262→            ) as Record<Emotion, number>;
+   263→   263→            let smLabel: Emotion = label;
+   264→   264→            let smConf = conf;
+   265→   265→            for (const k of EMOTIONS) {
+   266→   266→              if (avg[k] > smConf) {
+   267→   267→                smConf = avg[k];
+   268→   268→                smLabel = k;
+   269→   269→              }
+   270→   270→            }
+   271→   271→
+   272→   272→            // Draw bounding box + label (annotation language from deck)
+   273→   273→            const box = detection.detection.box;
+   274→   274→            const color = EMOTION_COLOR[smLabel];
+   275→   275→            ctx.strokeStyle = color;
+   276→   276→            ctx.lineWidth = 3;
+   277→   277→            ctx.strokeRect(box.x, box.y, box.width, box.height);
+   278→   278→            const labelText = `${smLabel.toUpperCase()} · ${(smConf * 100).toFixed(0)}%`;
+   279→   279→            ctx.font = "600 20px 'JetBrains Mono', monospace";
+   280→   280→            const tw = ctx.measureText(labelText).width + 20;
+   281→   281→            const ty = box.y + box.height + 8;
+   282→   282→            ctx.fillStyle = color;
+   283→   283→            ctx.fillRect(box.x, ty, tw, 34);
+   284→   284→            ctx.fillStyle = "#ffffff";
+   285→   285→            ctx.fillText(labelText, box.x + 10, ty + 24);
+   286→   286→
+   287→   287→            setCurrentLabel(smLabel);
+   288→   288→            setCurrentConf(smConf);
+   289→   289→
+   290→   290→            // Update cumulative frequency + log significant transitions
+   291→   291→            setCumulative((prev) => {
+   292→   292→              const next = { ...prev };
+   293→   293→              next[smLabel] = (next[smLabel] ?? 0) + 1;
+   294→   294→              return next;
+   295→   295→            });
+   296→   296→
+   297→   297→            // Emit a log entry every ~40 frames when high-confidence,
+   298→   298→            // capturing a snapshot of the current frame for the PDF report.
+   299→   299→            if (
+   300→   300→              smConf > 0.55 &&
+   301→   301→              frameCounterRef.current % 40 === 0 &&
+   302→   302→              frameCounterRef.current > 0
+   303→   303→            ) {
+   304→   304→              const t = (performance.now() - startedAtRef.current) / 1000;
+   305→   305→              let snapshot: string | undefined;
+   306→   306→              try {
+   307→   307→                const snap = document.createElement("canvas");
+   308→   308→                snap.width = 320;
+   309→   309→                snap.height = Math.round((v.videoHeight / v.videoWidth) * 320);
+   310→   310→                const sctx = snap.getContext("2d");
+   311→   311→                if (sctx) {
+   312→   312→                  sctx.drawImage(v, 0, 0, snap.width, snap.height);
+   313→   313→                  // Overlay bounding box (scaled)
+   314→   314→                  const scale = snap.width / v.videoWidth;
+   315→   315→                  sctx.strokeStyle = color;
+   316→   316→                  sctx.lineWidth = 2;
+   317→   317→                  sctx.strokeRect(
+   318→   318→                    box.x * scale,
+   319→   319→                    box.y * scale,
+   320→   320→                    box.width * scale,
+   321→   321→                    box.height * scale,
+   322→   322→                  );
+   323→   323→                  snapshot = snap.toDataURL("image/jpeg", 0.7);
+   324→   324→                }
+   325→   325→              } catch {
+   326→   326→                /* ignore snapshot failures */
+   327→   327→              }
+   328→   328→              setLog((l) =>
+   329→   329→                [...l, { t, emotion: smLabel, conf: smConf, snapshot }].slice(-40),
+   330→   330→              );
+   331→   331→            }
+   332→   332→          } else {
+   333→   333→            framesSinceFaceRef.current += 1;
+   334→   334→            if (framesSinceFaceRef.current >= 2) setNoFaceWarning(true);
+   335→   335→          }
+   336→   336→        }
+   337→   337→
+   338→   338→        // FPS
+   339→   339→        frameCounterRef.current += 1;
+   340→   340→        const now = performance.now();
+   341→   341→        const dt = now - lastFpsTickRef.current;
+   342→   342→        if (dt >= 1000) {
+   343→   343→          setFps(Math.round((frameCounterRef.current * 1000) / dt));
+   344→   344→          lastFpsTickRef.current = now;
+   345→   345→          frameCounterRef.current = 0;
+   346→   346→        }
+   347→   347→      }
+   348→   348→      rafRef.current = requestAnimationFrame(tick);
+   349→   349→    };
+   350→   350→    rafRef.current = requestAnimationFrame(tick);
+   351→   351→  }, []);
+   352→   352→
+   353→   353→  const stateColor =
+   354→   354→    state === "PROCESSING"
+   355→   355→      ? "text-primary"
+   356→   356→      : state === "ERROR"
+   357→   357→        ? "text-destructive"
+   358→   358→        : state === "LOADING"
+   359→   359→          ? "text-warn-fg"
+   360→   360→          : "text-muted-foreground";
+   361→   361→
+   362→   362→  return (
+   363→   363→    <div className="min-h-screen bg-background text-foreground p-4 md:p-8">
+   364→   364→      <div className="mx-auto max-w-[1600px]">
+   365→   365→        {/* Deck-style header */}
+   366→   366→        <header className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
+   367→   367→          <div>
+   368→   368→            <div className="font-mono-tight text-[11px] uppercase tracking-[0.2em] text-primary">
+   369→   369→              07 · UI · Main Window
+   370→   370→            </div>
+   371→   371→            <h1 className="mt-1 font-serif text-3xl md:text-4xl font-semibold tracking-tight">
+   372→   372→              Three-panel layout for the investigator
+   373→   373→            </h1>
+   374→   374→          </div>
+   375→   375→          <div className="flex items-center gap-3">
+   376→   376→            <Link
+   377→   377→              to="/architecture"
+   378→   378→              className="inline-flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 font-mono-tight text-[11px] uppercase tracking-[0.16em] text-foreground transition-colors hover:bg-accent"
+   379→   379→            >
+   380→   380→              <Network className="h-3.5 w-3.5 text-primary" />
+   381→   381→              View architecture
+   382→   382→            </Link>
+   383→   383→            <span className="font-mono-tight text-xs text-muted-foreground">
+   384→   384→              AIT · CSE · 2025-26
+   385→   385→            </span>
+   386→   386→          </div>
+   387→   387→
+   388→   388→        </header>
+   389→   389→        <div className="mb-6 h-px bg-border" />
+   390→   390→
+   391→   391→        {/* Window frame */}
+   392→   392→        <div className="rounded-xl border border-border bg-card shadow-sm overflow-hidden">
+   393→   393→          {/* Title bar */}
+   394→   394→          <div className="flex items-center gap-3 border-b border-border bg-panel px-4 py-2.5">
+   395→   395→            <div className="flex gap-1.5">
+   396→   396→              <span className="h-3 w-3 rounded-full bg-red-400/80" />
+   397→   397→              <span className="h-3 w-3 rounded-full bg-yellow-400/80" />
+   398→   398→              <span className="h-3 w-3 rounded-full bg-green-500/80" />
+   399→   399→            </div>
+   400→   400→            <div className="flex-1 text-center font-mono-tight text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+   401→   401→              Micro-Expression Recognition System · Session:{" "}
+   402→   402→              <span className="text-foreground">{sessionId}</span>
+   403→   403→            </div>
+   404→   404→            <div className="flex items-center gap-3 font-mono-tight text-[11px] text-muted-foreground">
+   405→   405→              <span>FPS {fps}</span>
+   406→   406→              <span className="flex items-center gap-1.5">
+   407→   407→                <Circle
+   408→   408→                  className={`h-2 w-2 fill-current ${stateColor} ${
+   409→   409→                    state === "PROCESSING" ? "processing-dot" : ""
+   410→   410→                  }`}
+   411→   411→                />
+   412→   412→                <span className={stateColor}>{state}</span>
+   413→   413→              </span>
+   414→   414→            </div>
+   415→   415→          </div>
+   416→   416→
+   417→   417→          <div className="grid grid-cols-12 gap-0">
+   418→   418→            {/* LEFT: CONTROL */}
+   419→   419→            <aside className="col-span-12 md:col-span-3 lg:col-span-2 border-r border-border p-4 space-y-2">
+   420→   420→              <SectionLabel>Control</SectionLabel>
+   421→   421→
+   422→   422→              <PanelButton icon={<Video className="h-4 w-4" />} label="Load Video" disabled />
+   423→   423→              <PanelButton
+   424→   424→                icon={<Play className="h-4 w-4" />}
+   425→   425→                label="Start Live Analysis"
+   426→   426→                onClick={startSession}
+   427→   427→                active={state === "PROCESSING"}
+   428→   428→                disabled={!modelReady || state === "PROCESSING"}
+   429→   429→              />
+   430→   430→              <PanelButton
+   431→   431→                icon={<Square className="h-4 w-4" />}
+   432→   432→                label="Stop"
+   433→   433→                onClick={stopSession}
+   434→   434→                disabled={state !== "PROCESSING"}
+   435→   435→              />
+   436→   436→              <PanelButton
+   437→   437→                icon={<FileText className="h-4 w-4" />}
+   438→   438→                label="Export PDF Report"
+   439→   439→                onClick={exportReport}
+   440→   440→                disabled={log.length === 0 && totalCumulative === 0}
+   441→   441→              />
+   442→   442→              <PanelButton icon={<SettingsIcon className="h-4 w-4" />} label="Settings" disabled />
+   443→   443→
+   444→   444→              <div className="my-4 border-t border-dashed border-border" />
+   445→   445→
+   446→   446→              <SectionLabel>Status</SectionLabel>
+   447→   447→              <div className="mt-2 inline-flex items-center gap-2 rounded-full border-2 border-primary/60 px-3 py-1.5 font-mono-tight text-[11px] uppercase tracking-[0.15em] text-primary">
+   448→   448→                <Circle
+   449→   449→                  className={`h-2 w-2 fill-current ${
+   450→   450→                    state === "PROCESSING" ? "processing-dot" : ""
+   451→   451→                  }`}
+   452→   452→                />
+   453→   453→                {state}
+   454→   454→              </div>
+   455→   455→
+   456→   456→              <div className="mt-6 space-y-3 font-mono-tight text-[10px] uppercase tracking-wider text-muted-foreground">
+   457→   457→                <PipelineStep icon={<Camera className="h-3 w-3" />} label="M1 · Input" active={state === "PROCESSING"} />
+   458→   458→                <PipelineStep icon={<Layers className="h-3 w-3" />} label="M2 · Face + CLAHE" active={state === "PROCESSING" && !noFaceWarning} />
+   459→   459→                <PipelineStep icon={<Cpu className="h-3 w-3" />} label="M3 · CNN 512-D" active={state === "PROCESSING" && !noFaceWarning} />
+   460→   460→                <PipelineStep icon={<Activity className="h-3 w-3" />} label="M4-6 · LSTM · Softmax" active={bufferFill === 16} />
+   461→   461→              </div>
+   462→   462→            </aside>
+   463→   463→
+   464→   464→            {/* CENTER: STAGE */}
+   465→   465→            <section className="col-span-12 md:col-span-6 lg:col-span-7 relative bg-stage">
+   466→   466→              {/* Warning banner */}
+   467→   467→              {noFaceWarning && state === "PROCESSING" && (
+   468→   468→                <div className="absolute inset-x-0 top-0 z-20 flex items-center justify-center gap-2 border-b border-warn-fg/20 bg-warn px-4 py-2 text-sm text-warn-fg">
+   469→   469→                  <AlertTriangle className="h-4 w-4" />
+   470→   470→                  No face detected in {framesSinceFaceRef.current} frames
+   471→   471→                </div>
+   472→   472→              )}
+   473→   473→
+   474→   474→              <div className="relative aspect-video w-full">
+   475→   475→                <video
+   476→   476→                  ref={videoRef}
+   477→   477→                  className="absolute inset-0 h-full w-full object-cover"
+   478→   478→                  muted
+   479→   479→                  playsInline
+   480→   480→                />
+   481→   481→                <canvas
+   482→   482→                  ref={canvasRef}
+   483→   483→                  className="absolute inset-0 h-full w-full object-cover"
+   484→   484→                />
+   485→   485→
+   486→   486→                {state !== "PROCESSING" && (
+   487→   487→                  <div className="absolute inset-0 flex items-center justify-center">
+   488→   488→                    <div className="text-center">
+   489→   489→                      <div
+   490→   490→                        className={`mx-auto flex h-56 w-44 items-center justify-center rounded-2xl border-2 ${
+   491→   491→                          state === "LOADING"
+   492→   492→                            ? "border-primary/50"
+   493→   493→                            : "border-primary/70"
+   494→   494→                        } scan-box`}
+   495→   495→                      >
+   496→   496→                        <div className="h-40 w-32 rounded-full bg-white/10" />
+   497→   497→                      </div>
+   498→   498→                      <div className="mt-6 font-mono-tight text-xs uppercase tracking-[0.2em] text-white/70">
+   499→   499→                        {state === "LOADING"
+   500→   500→                          ? "Loading CNN weights…"
+   501→   501→                          : state === "ERROR"
+   502→   502→                            ? error ?? "Error"
+   503→   503→                            : "Press ▶ Start Live Analysis"}
+   504→   504→                      </div>
+   505→   505→                    </div>
+   506→   506→                  </div>
+   507→   507→                )}
+   508→   508→
+   509→   509→                {/* Current label pill (below face box) */}
+   510→   510→                {state === "PROCESSING" && currentLabel && (
+   511→   511→                  <div className="pointer-events-none absolute bottom-14 left-1/2 -translate-x-1/2">
+   512→   512→                    <div
+   513→   513→                      className="rounded-md px-4 py-1.5 font-mono-tight text-sm font-semibold text-white shadow-lg"
+   514→   514→                      style={{ backgroundColor: EMOTION_COLOR[currentLabel] }}
+   515→   515→                    >
+   516→   516→                      {currentLabel.toUpperCase()} · {(currentConf * 100).toFixed(0)}%
+   517→   517→                    </div>
+   518→   518→                  </div>
+   519→   519→                )}
+   520→   520→
+   521→   521→                {/* Buffer / confidence bar */}
+   522→   522→                <div className="absolute bottom-4 left-6 right-6">
+   523→   523→                  <div className="mb-1 flex justify-between font-mono-tight text-[10px] uppercase tracking-wider text-white/60">
+   524→   524→                    <span>Sequence buffer · 16 frames</span>
+   525→   525→                    <span>
+   526→   526→                      {bufferFill}/16 · stride 4
+   527→   527→                    </span>
+   528→   528→                  </div>
+   529→   529→                  <div className="h-2 w-full overflow-hidden rounded-full bg-white/15">
+   530→   530→                    <div
+   531→   531→                      className="h-full bg-primary transition-[width] duration-150"
+   532→   532→                      style={{ width: `${(bufferFill / 16) * 100}%` }}
+   533→   533→                    />
+   534→   534→                  </div>
+   535→   535→                </div>
+   536→   536→              </div>
+   537→   537→            </section>
+   538→   538→
+   539→   539→            {/* RIGHT: SESSION SUMMARY */}
+   540→   540→            <aside className="col-span-12 md:col-span-3 border-l border-border p-4">
+   541→   541→              <SectionLabel>Session Summary</SectionLabel>
+   542→   542→              <p className="mt-1 text-xs text-muted-foreground">
+   543→   543→                Emotion frequency (cumulative)
+   544→   544→              </p>
+   545→   545→
+   546→   546→              <div className="mt-4 space-y-2">
+   547→   547→                {EMOTIONS.map((e) => {
+   548→   548→                  const pct =
+   549→   549→                    totalCumulative === 0
+   550→   550→                      ? 0
+   551→   551→                      : Math.round((cumulative[e] / totalCumulative) * 100);
+   552→   552→                  return (
+   553→   553→                    <div key={e} className="flex items-center gap-2 font-mono-tight text-xs">
+   554→   554→                      <div className="w-20 text-muted-foreground">{e}</div>
+   555→   555→                      <div className="flex-1 h-2 rounded-full bg-border/60 overflow-hidden">
+   556→   556→                        <div
+   557→   557→                          className="h-full transition-[width] duration-300"
+   558→   558→                          style={{
+   559→   559→                            width: `${pct}%`,
+   560→   560→                            backgroundColor: EMOTION_COLOR[e],
+   561→   561→                          }}
+   562→   562→                        />
+   563→   563→                      </div>
+   564→   564→                      <div className="w-10 text-right tabular-nums">{pct}%</div>
+   565→   565→                    </div>
+   566→   566→                  );
+   567→   567→                })}
+   568→   568→              </div>
+   569→   569→
+   570→   570→              <div className="mt-6 border-t border-dashed border-border pt-4 font-mono-tight text-[11px] leading-relaxed text-muted-foreground">
+   571→   571→                Updates every 10 s ·<br />
+   572→   572→                Window: 16 frames
+   573→   573→              </div>
+   574→   574→
+   575→   575→              {log.length > 0 && (
+   576→   576→                <div className="mt-6">
+   577→   577→                  <SectionLabel>Recent flags</SectionLabel>
+   578→   578→                  <div className="mt-2 space-y-1 font-mono-tight text-[11px] max-h-40 overflow-auto pr-1">
+   579→   579→                    {log
+   580→   580→                      .slice()
+   581→   581→                      .reverse()
+   582→   582→                      .slice(0, 8)
+   583→   583→                      .map((l, i) => (
+   584→   584→                        <div
+   585→   585→                          key={i}
+   586→   586→                          className="flex items-center justify-between gap-2 rounded border border-border/60 bg-card px-2 py-1"
+   587→   587→                        >
+   588→   588→                          <span className="text-muted-foreground">
+   589→   589→                            {formatTime(l.t)}
+   590→   590→                          </span>
+   591→   591→                          <span
+   592→   592→                            className="font-semibold"
+   593→   593→                            style={{ color: EMOTION_COLOR[l.emotion] }}
+   594→   594→                          >
+   595→   595→                            {l.emotion}
+   596→   596→                          </span>
+   597→   597→                          <span className="tabular-nums text-foreground">
+   598→   598→                            {l.conf.toFixed(2)}
+   599→   599→                          </span>
+   600→   600→                        </div>
+   601→   601→                      ))}
+   602→   602→                  </div>
+   603→   603→                </div>
+   604→   604→              )}
+   605→   605→            </aside>
+   606→   606→          </div>
+   607→   607→        </div>
+   608→   608→
+   609→   609→        {/* Bottom deck-style caption */}
+   610→   610→        <footer className="mt-4 flex flex-wrap items-center justify-between gap-2 font-mono-tight text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+   611→   611→          <span>
+   612→   612→            Pipeline · MTCNN → ResNet-50 (512-D) → 2× LSTM 256 → Softmax × 7
+   613→   613→          </span>
+   614→   614→          <span>Local · Private · Real-time · ≥10 FPS · &lt;500 ms latency</span>
+   615→   615→        </footer>
+   616→   616→      </div>
+   617→   617→    </div>
+   618→   618→  );
+   619→   619→}
+   620→   620→
+   621→   621→function SectionLabel({ children }: { children: React.ReactNode }) {
+   622→   622→  return (
+   623→   623→    <div className="font-mono-tight text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+   624→   624→      {children}
+   625→   625→    </div>
+   626→   626→  );
+   627→   627→}
+   628→   628→
+   629→   629→function PanelButton({
+   630→   630→  icon,
+   631→   631→  label,
+   632→   632→  onClick,
+   633→   633→  disabled,
+   634→   634→  active,
+   635→   635→}: {
+   636→   636→  icon: React.ReactNode;
+   637→   637→  label: string;
+   638→   638→  onClick?: () => void;
+   639→   639→  disabled?: boolean;
+   640→   640→  active?: boolean;
+   641→   641→}) {
+   642→   642→  return (
+   643→   643→    <button
+   644→   644→      onClick={onClick}
+   645→   645→      disabled={disabled}
+   646→   646→      className={[
+   647→   647→        "w-full flex items-center gap-3 rounded-md border px-3 py-2.5 text-sm text-left transition-colors",
+   648→   648→        active
+   649→   649→          ? "border-primary bg-primary/10 text-primary"
+   650→   650→          : "border-border bg-card hover:bg-accent/40",
+   651→   651→        disabled ? "opacity-50 cursor-not-allowed hover:bg-card" : "cursor-pointer",
+   652→   652→      ].join(" ")}
+   653→   653→    >
+   654→   654→      <span className={active ? "text-primary" : "text-muted-foreground"}>{icon}</span>
+   655→   655→      <span className="font-medium">{label}</span>
+   656→   656→    </button>
+   657→   657→  );
+   658→   658→}
+   659→   659→
+   660→   660→function PipelineStep({
+   661→   661→  icon,
+   662→   662→  label,
+   663→   663→  active,
+   664→   664→}: {
+   665→   665→  icon: React.ReactNode;
+   666→   666→  label: string;
+   667→   667→  active: boolean;
+   668→   668→}) {
+   669→   669→  return (
+   670→   670→    <div
+   671→   671→      className={`flex items-center gap-2 ${
+   672→   672→        active ? "text-primary" : "text-muted-foreground/70"
+   673→   673→      }`}
+   674→   674→    >
+   675→   675→      <span>{icon}</span>
+   676→   676→      <span>{label}</span>
+   677→   677→    </div>
+   678→   678→  );
+   679→   679→}
+   680→   680→
+   681→   681→function formatTime(t: number) {
+   682→   682→  const m = Math.floor(t / 60)
+   683→   683→    .toString()
+   684→   684→    .padStart(2, "0");
+   685→   685→  const s = Math.floor(t % 60)
+   686→   686→    .toString()
+   687→   687→    .padStart(2, "0");
+   688→   688→  return `${m}:${s}`;
+   689→   689→}
+   690→   690→
+   691→   691→function makeSessionId() {
+   692→   692→  const d = new Date();
+   693→   693→  const pad = (n: number) => n.toString().padStart(2, "0");
+   694→   694→  return (
+   695→   695→    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}` +
+   696→   696→    `_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+   697→   697→  );
+   698→   698→}
+   699→   699→
+   700→   700→// ---------------------------------------------------------------------------
+   701→   701→// PDF report generation
+   702→   702→// ---------------------------------------------------------------------------
+   703→   703→
+   704→   704→interface ReportInput {
+   705→   705→  sessionId: string;
+   706→   706→  durationSec: number;
+   707→   707→  cumulative: Record<Emotion, number>;
+   708→   708→  totalCumulative: number;
+   709→   709→  log: SessionLogEntry[];
+   710→   710→}
+   711→   711→
+   712→   712→function generatePdfReport(input: ReportInput) {
+   713→   713→  const { sessionId, durationSec, cumulative, totalCumulative, log } = input;
+   714→   714→  const doc = new jsPDF({ unit: "pt", format: "a4" });
+   715→   715→  const W = doc.internal.pageSize.getWidth();
+   716→   716→  const H = doc.internal.pageSize.getHeight();
+   717→   717→  const M = 40; // margin
+   718→   718→
+   719→   719→  // ---------- Cover / header ----------
+   720→   720→  doc.setFillColor(250, 247, 240);
+   721→   721→  doc.rect(0, 0, W, 90, "F");
+   722→   722→  doc.setTextColor(13, 117, 102);
+   723→   723→  doc.setFont("courier", "bold");
+   724→   724→  doc.setFontSize(9);
+   725→   725→  doc.text("MICRO-EXPRESSION RECOGNITION SYSTEM  ·  SESSION REPORT", M, 36);
+   726→   726→  doc.setTextColor(20, 20, 30);
+   727→   727→  doc.setFont("helvetica", "bold");
+   728→   728→  doc.setFontSize(20);
+   729→   729→  doc.text("Investigator Session Report", M, 66);
+   730→   730→  doc.setFont("courier", "normal");
+   731→   731→  doc.setFontSize(9);
+   732→   732→  doc.setTextColor(90, 90, 100);
+   733→   733→  doc.text(
+   734→   734→    `Session: ${sessionId}   ·   Duration: ${formatTime(durationSec)}   ·   Generated: ${new Date().toLocaleString()}`,
+   735→   735→    M,
+   736→   736→    82,
+   737→   737→  );
+   738→   738→
+   739→   739→  // ---------- Session summary block ----------
+   740→   740→  let y = 110;
+   741→   741→  doc.setDrawColor(220, 216, 200);
+   742→   742→  doc.setLineWidth(0.5);
+   743→   743→  doc.line(M, y, W - M, y);
+   744→   744→  y += 18;
+   745→   745→
+   746→   746→  doc.setFont("helvetica", "bold");
+   747→   747→  doc.setFontSize(12);
+   748→   748→  doc.setTextColor(20, 20, 30);
+   749→   749→  doc.text("Session Summary", M, y);
+   750→   750→  y += 6;
+   751→   751→  doc.setFont("helvetica", "normal");
+   752→   752→  doc.setFontSize(9);
+   753→   753→  doc.setTextColor(90, 90, 100);
+   754→   754→  y += 12;
+   755→   755→  doc.text(
+   756→   756→    "Cumulative frequency of each Ekman-7 emotion detected across the session.",
+   757→   757→    M,
+   758→   758→    y,
+   759→   759→  );
+   760→   760→  y += 18;
+   761→   761→
+   762→   762→  // Cumulative bars
+   763→   763→  const barX = M;
+   764→   764→  const barW = W - 2 * M;
+   765→   765→  const barLabelW = 90;
+   766→   766→  const barValueW = 40;
+   767→   767→  const barTrackW = barW - barLabelW - barValueW - 20;
+   768→   768→  for (const e of EMOTIONS) {
+   769→   769→    const pct = totalCumulative === 0 ? 0 : cumulative[e] / totalCumulative;
+   770→   770→    doc.setFont("courier", "normal");
+   771→   771→    doc.setFontSize(10);
+   772→   772→    doc.setTextColor(60, 60, 70);
+   773→   773→    doc.text(e, barX, y + 10);
+   774→   774→    // track
+   775→   775→    doc.setFillColor(232, 228, 214);
+   776→   776→    doc.roundedRect(barX + barLabelW, y + 2, barTrackW, 10, 3, 3, "F");
+   777→   777→    // fill
+   778→   778→    const [r, g, b] = hexToRgb(EMOTION_COLOR[e]);
+   779→   779→    doc.setFillColor(r, g, b);
+   780→   780→    doc.roundedRect(
+   781→   781→      barX + barLabelW,
+   782→   782→      y + 2,
+   783→   783→      Math.max(2, barTrackW * pct),
+   784→   784→      10,
+   785→   785→      3,
+   786→   786→      3,
+   787→   787→      "F",
+   788→   788→    );
+   789→   789→    doc.setTextColor(40, 40, 50);
+   790→   790→    doc.text(`${Math.round(pct * 100)}%`, barX + barLabelW + barTrackW + 8, y + 10);
+   791→   791→    y += 18;
+   792→   792→  }
+   793→   793→
+   794→   794→  // ---------- Timeline chart ----------
+   795→   795→  y += 12;
+   796→   796→  doc.setFont("helvetica", "bold");
+   797→   797→  doc.setFontSize(12);
+   798→   798→  doc.setTextColor(20, 20, 30);
+   799→   799→  doc.text("Emotion Timeline", M, y);
+   800→   800→  y += 6;
+   801→   801→  doc.setFont("helvetica", "normal");
+   802→   802→  doc.setFontSize(9);
+   803→   803→  doc.setTextColor(90, 90, 100);
+   804→   804→  y += 12;
+   805→   805→  doc.text(
+   806→   806→    "Each dot is a high-confidence detection (>0.55). Y-axis groups by emotion; x-axis is session time.",
+   807→   807→    M,
+   808→   808→    y,
+   809→   809→  );
+   810→   810→  y += 10;
+   811→   811→
+   812→   812→  const chartX = M;
+   813→   813→  const chartY = y + 8;
+   814→   814→  const chartW = W - 2 * M;
+   815→   815→  const chartH = 190;
+   816→   816→  // frame
+   817→   817→  doc.setDrawColor(220, 216, 200);
+   818→   818→  doc.setFillColor(252, 250, 244);
+   819→   819→  doc.rect(chartX, chartY, chartW, chartH, "FD");
+   820→   820→
+   821→   821→  const rowH = chartH / EMOTIONS.length;
+   822→   822→  // Y grid + labels
+   823→   823→  doc.setFont("courier", "normal");
+   824→   824→  doc.setFontSize(8);
+   825→   825→  EMOTIONS.forEach((e, i) => {
+   826→   826→    const ry = chartY + i * rowH;
+   827→   827→    if (i > 0) {
+   828→   828→      doc.setDrawColor(230, 226, 210);
+   829→   829→      doc.line(chartX, ry, chartX + chartW, ry);
+   830→   830→    }
+   831→   831→    doc.setTextColor(100, 100, 110);
+   832→   832→    doc.text(e, chartX + 4, ry + rowH / 2 + 3);
+   833→   833→  });
+   834→   834→
+   835→   835→  const maxT = Math.max(durationSec, 1, ...log.map((l) => l.t));
+   836→   836→  // X-axis ticks
+   837→   837→  const ticks = 5;
+   838→   838→  doc.setDrawColor(220, 216, 200);
+   839→   839→  for (let i = 0; i <= ticks; i++) {
+   840→   840→    const tx = chartX + (chartW * i) / ticks;
+   841→   841→    doc.line(tx, chartY + chartH, tx, chartY + chartH + 4);
+   842→   842→    const tLabel = formatTime((maxT * i) / ticks);
+   843→   843→    doc.setTextColor(120, 120, 130);
+   844→   844→    doc.text(tLabel, tx - 12, chartY + chartH + 14);
+   845→   845→  }
+   846→   846→
+   847→   847→  // Plot dots + trend line per emotion row
+   848→   848→  for (const entry of log) {
+   849→   849→    const rowIdx = EMOTIONS.indexOf(entry.emotion);
+   850→   850→    if (rowIdx < 0) continue;
+   851→   851→    const cx = chartX + (entry.t / maxT) * chartW;
+   852→   852→    const cy = chartY + rowIdx * rowH + rowH / 2;
+   853→   853→    const [r, g, b] = hexToRgb(EMOTION_COLOR[entry.emotion]);
+   854→   854→    doc.setFillColor(r, g, b);
+   855→   855→    const radius = 2 + entry.conf * 4;
+   856→   856→    doc.circle(cx, cy, radius, "F");
+   857→   857→  }
+   858→   858→
+   859→   859→  y = chartY + chartH + 28;
+   860→   860→
+   861→   861→  // ---------- Event log table ----------
+   862→   862→  if (y > H - 100) {
+   863→   863→    doc.addPage();
+   864→   864→    y = M;
+   865→   865→  }
+   866→   866→  doc.setFont("helvetica", "bold");
+   867→   867→  doc.setFontSize(12);
+   868→   868→  doc.setTextColor(20, 20, 30);
+   869→   869→  doc.text("Event Log", M, y);
+   870→   870→  y += 16;
+   871→   871→
+   872→   872→  // Table header
+   873→   873→  const cols = [
+   874→   874→    { label: "Time", x: M, w: 60 },
+   875→   875→    { label: "Emotion", x: M + 60, w: 90 },
+   876→   876→    { label: "Confidence", x: M + 150, w: 90 },
+   877→   877→    { label: "Note", x: M + 240, w: W - 2 * M - 240 },
+   878→   878→  ];
+   879→   879→  doc.setFillColor(238, 233, 218);
+   880→   880→  doc.rect(M, y - 12, W - 2 * M, 18, "F");
+   881→   881→  doc.setFont("courier", "bold");
+   882→   882→  doc.setFontSize(9);
+   883→   883→  doc.setTextColor(60, 60, 70);
+   884→   884→  cols.forEach((c) => doc.text(c.label, c.x + 4, y));
+   885→   885→  y += 10;
+   886→   886→
+   887→   887→  doc.setFont("courier", "normal");
+   888→   888→  doc.setFontSize(9);
+   889→   889→  const rows = log.slice().reverse();
+   890→   890→  for (const l of rows) {
+   891→   891→    if (y > H - 40) {
+   892→   892→      doc.addPage();
+   893→   893→      y = M;
+   894→   894→    }
+   895→   895→    doc.setTextColor(60, 60, 70);
+   896→   896→    doc.text(formatTime(l.t), cols[0]!.x + 4, y);
+   897→   897→    const [r, g, b] = hexToRgb(EMOTION_COLOR[l.emotion]);
+   898→   898→    doc.setTextColor(r, g, b);
+   899→   899→    doc.text(l.emotion, cols[1]!.x + 4, y);
+   900→   900→    doc.setTextColor(60, 60, 70);
+   901→   901→    doc.text(l.conf.toFixed(2), cols[2]!.x + 4, y);
+   902→   902→    doc.text(noteFor(l.emotion, l.conf), cols[3]!.x + 4, y);
+   903→   903→    y += 14;
+   904→   904→  }
+   905→   905→
+   906→   906→  // ---------- Snapshots page ----------
+   907→   907→  const withSnap = log.filter((l) => l.snapshot);
+   908→   908→  if (withSnap.length > 0) {
+   909→   909→    doc.addPage();
+   910→   910→    let sy = M;
+   911→   911→    doc.setFont("helvetica", "bold");
+   912→   912→    doc.setFontSize(14);
+   913→   913→    doc.setTextColor(20, 20, 30);
+   914→   914→    doc.text("Flagged Frame Snapshots", M, sy);
+   915→   915→    sy += 8;
+   916→   916→    doc.setFont("helvetica", "normal");
+   917→   917→    doc.setFontSize(9);
+   918→   918→    doc.setTextColor(90, 90, 100);
+   919→   919→    sy += 14;
+   920→   920→    doc.text(
+   921→   921→      "Frames captured at high-confidence detections, with the CNN bounding box overlay.",
+   922→   922→      M,
+   923→   923→      sy,
+   924→   924→    );
+   925→   925→    sy += 18;
+   926→   926→
+   927→   927→    const cellW = (W - 2 * M - 20) / 2;
+   928→   928→    const cellH = cellW * 0.62;
+   929→   929→    let col = 0;
+   930→   930→    for (const l of withSnap.slice(0, 8)) {
+   931→   931→      if (sy + cellH + 40 > H - M) {
+   932→   932→        doc.addPage();
+   933→   933→        sy = M;
+   934→   934→      }
+   935→   935→      const cx = M + col * (cellW + 20);
+   936→   936→      try {
+   937→   937→        doc.addImage(l.snapshot!, "JPEG", cx, sy, cellW, cellH);
+   938→   938→      } catch {
+   939→   939→        /* skip broken snapshot */
+   940→   940→      }
+   941→   941→      doc.setDrawColor(220, 216, 200);
+   942→   942→      doc.rect(cx, sy, cellW, cellH);
+   943→   943→      doc.setFont("courier", "normal");
+   944→   944→      doc.setFontSize(9);
+   945→   945→      const [r, g, b] = hexToRgb(EMOTION_COLOR[l.emotion]);
+   946→   946→      doc.setTextColor(r, g, b);
+   947→   947→      doc.text(
+   948→   948→        `${formatTime(l.t)}  ·  ${l.emotion.toUpperCase()}  ·  ${(l.conf * 100).toFixed(0)}%`,
+   949→   949→        cx,
+   950→   950→        sy + cellH + 14,
+   951→   951→      );
+   952→   952→      col += 1;
+   953→   953→      if (col >= 2) {
+   954→   954→        col = 0;
+   955→   955→        sy += cellH + 30;
+   956→   956→      }
+   957→   957→    }
+   958→   958→  }
+   959→   959→
+   960→   960→  // ---------- Footer on every page ----------
+   961→   961→  const pageCount = doc.getNumberOfPages();
+   962→   962→  for (let p = 1; p <= pageCount; p++) {
+   963→   963→    doc.setPage(p);
+   964→   964→    doc.setFont("courier", "normal");
+   965→   965→    doc.setFontSize(8);
+   966→   966→    doc.setTextColor(140, 140, 150);
+   967→   967→    doc.text(
+   968→   968→      `AIT · CSE · 2025-26   ·   CNN-LSTM Pipeline   ·   ${sessionId}`,
+   969→   969→      M,
+   970→   970→      H - 18,
+   971→   971→    );
+   972→   972→    doc.text(`Page ${p} / ${pageCount}`, W - M - 50, H - 18);
+   973→   973→  }
+   974→   974→
+   975→   975→  doc.save(`session_${sessionId}.pdf`);
+   976→   976→}
+   977→   977→
+   978→   978→function hexToRgb(hex: string): [number, number, number] {
+   979→   979→  const h = hex.replace("#", "");
+   980→   980→  return [
+   981→   981→    parseInt(h.substring(0, 2), 16),
+   982→   982→    parseInt(h.substring(2, 4), 16),
+   983→   983→    parseInt(h.substring(4, 6), 16),
+   984→   984→  ];
+   985→   985→}
+   986→   986→
+   987→   987→function noteFor(e: Emotion, conf: number): string {
+   988→   988→  const strong = conf > 0.75;
+   989→   989→  const map: Record<Emotion, string> = {
+   990→   990→    Fear: strong ? "High-stakes concealment cue" : "Fear onset",
+   991→   991→    Anger: strong ? "Suppressed anger apex" : "Anger cue",
+   992→   992→    Disgust: strong ? "Repression pattern" : "Disgust micro-cue",
+   993→   993→    Happiness: strong ? "Duchenne happiness" : "Positive affect",
+   994→   994→    Sadness: strong ? "Grief marker" : "Sadness onset",
+   995→   995→    Surprise: strong ? "Brief apex after direct question" : "Surprise cue",
+   996→   996→    Contempt: strong ? "Asymmetric lip corner" : "Contempt trace",
+   997→   997→  };
+   998→   998→  return map[e];
+   999→   999→}
+  1000→  1000→

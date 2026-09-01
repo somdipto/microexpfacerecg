@@ -1,0 +1,44 @@
+// Micro-Expression Recognition — Prisma schema
+// Sessions and per-frame prediction events persisted on-device (SQLite).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Session {
+  id          String   @id @default(cuid())
+  sessionId   String   @unique // human-readable SESS-YYYYMMDD-HHMMSS
+  source      String   @default("webcam")
+  durationSec Float    @default(0)
+  totalFrames Int      @default(0)
+  leakageRisk Int      @default(0)
+  maskLabel   String   @default("Happiness")
+  distribution String  @default("{}") // JSON: Record<Emotion, number>
+  spikesJson  String   @default("[]") // JSON: MicroSpike[]
+  note        String?
+  createdAt   DateTime @default(now())
+
+  predictions Prediction[]
+
+  @@index([createdAt])
+}
+
+model Prediction {
+  id        String   @id @default(cuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  t         Float    // seconds from session start
+  emotion   String
+  conf      Float
+  isSpike   Boolean  @default(false)
+  isLeakage Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([sessionId])
+  @@index([emotion])
+}
